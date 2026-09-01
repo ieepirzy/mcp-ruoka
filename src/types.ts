@@ -8,6 +8,9 @@ export interface Product {
 	imageUrl: string | null;
 	brand: string | null;
 	category: string | null;
+	isAvailable?: boolean | null;
+	priceUnit?: string | null;
+	priceIsApproximate?: boolean;
 	abv?: number | null;
 }
 
@@ -16,6 +19,9 @@ export interface Store {
 	name: string;
 	chain: Chain;
 	location: string;
+	isWebStore?: boolean;
+	hasPickup?: boolean;
+	hasHomeDelivery?: boolean;
 }
 
 export interface SearchResult {

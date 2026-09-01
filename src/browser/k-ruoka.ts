@@ -4,6 +4,7 @@ import type { Product, SearchResult, Store } from "../types.ts";
 import { getBuildNumber, getPage, resetSession } from "./session.ts";
 
 const API_TIMEOUT = 30_000;
+const STORE_SEARCH_LIMIT = 50;
 
 const BlockedResponseSchema = z.object({
 	_blocked: z.literal(true),
@@ -17,18 +18,21 @@ const ApiProductSchema = z.object({
 		ean: z.string(),
 		localizedName: z.object({ finnish: z.string() }),
 		images: z.array(z.string()).optional(),
+		isAvailable: z.boolean().optional(),
 		mobilescan: z
 			.object({
 				pricing: z
 					.object({
 						normal: z
 							.object({
-								price: z.number(),
+								price: z.number().optional(),
+								unit: z.string().optional(),
+								isApproximate: z.boolean().optional(),
 								unitPrice: z
 									.object({
-										value: z.number(),
-										unit: z.string(),
-										contentSize: z.number(),
+										value: z.number().optional(),
+										unit: z.string().optional(),
+										contentSize: z.number().optional(),
 									})
 									.optional(),
 							})
@@ -37,7 +41,7 @@ const ApiProductSchema = z.object({
 					.optional(),
 			})
 			.optional(),
-		brand: z.object({ name: z.string() }).optional(),
+		brand: z.object({ name: z.string().optional() }).optional(),
 		category: z
 			.object({
 				localizedName: z.object({ finnish: z.string() }).optional(),
@@ -48,6 +52,7 @@ const ApiProductSchema = z.object({
 
 const ApiSearchResponseSchema = z.object({
 	result: z.array(ApiProductSchema).optional(),
+	totalHits: z.number().int().nonnegative().optional(),
 	error: z.object({ message: z.string() }).optional(),
 });
 
@@ -57,14 +62,17 @@ type SearchEvalResult = z.infer<typeof SearchEvalResultSchema>;
 const ApiStoreSchema = z.object({
 	id: z.string(),
 	name: z.string(),
-	chain: z.string(),
-	chainName: z.string(),
-	location: z.string(),
-	isWebStore: z.boolean(),
+	chain: z.string().optional(),
+	chainName: z.string().optional(),
+	location: z.string().optional(),
+	isWebStore: z.boolean().optional(),
+	hasPickup: z.boolean().optional(),
+	hasHomeDelivery: z.boolean().optional(),
 });
 
 const ApiStoresResponseSchema = z.object({
 	results: z.array(ApiStoreSchema).optional(),
+	totalHits: z.number().int().nonnegative().optional(),
 });
 
 const StoresEvalResultSchema = z.union([BlockedResponseSchema, ApiStoresResponseSchema]);
@@ -79,18 +87,36 @@ function isBlocked(
 function parseProduct(item: z.infer<typeof ApiProductSchema>): Product {
 	const p = item.product;
 	const pricing = p.mobilescan?.pricing?.normal;
-	const unitPrice = pricing?.unitPrice;
+	const comparisonPrice = pricing?.unitPrice;
+	const comparisonValue = comparisonPrice?.value;
+	const comparisonUnit = comparisonPrice?.unit;
 
 	return {
 		name: p.localizedName.finnish,
 		price: pricing?.price ?? null,
-		unitPrice: unitPrice
-			? `${unitPrice.value.toFixed(2).replace(".", ",")} €/${unitPrice.unit}`
-			: null,
+		unitPrice:
+			comparisonValue !== undefined && comparisonUnit
+				? `${comparisonValue.toFixed(2).replace(".", ",")} €/${comparisonUnit}`
+				: null,
 		id: p.ean,
 		imageUrl: p.images?.[0] ?? null,
 		brand: p.brand?.name ?? null,
 		category: p.category?.localizedName?.finnish ?? null,
+		isAvailable: p.isAvailable ?? null,
+		priceUnit: pricing?.unit ?? null,
+		priceIsApproximate: pricing?.isApproximate ?? false,
+	};
+}
+
+function parseStore(item: z.infer<typeof ApiStoreSchema>): Store {
+	return {
+		id: item.id,
+		name: item.name,
+		chain: "k-ruoka",
+		location: item.location ?? "",
+		isWebStore: item.isWebStore ?? false,
+		hasPickup: item.hasPickup ?? false,
+		hasHomeDelivery: item.hasHomeDelivery ?? false,
 	};
 }
 
@@ -153,21 +179,45 @@ async function fetchSearchApi(
 	}
 }
 
-async function fetchStoresApi(): Promise<StoresEvalResult> {
+async function fetchStoresApi(query?: string): Promise<StoresEvalResult> {
 	const page = await getPage();
+	const buildNumber = getBuildNumber();
 
-	const raw = await page.evaluate(async (timeout: number) => {
-		const res = await fetch("/kr-api/stores", { signal: AbortSignal.timeout(timeout) });
-		const body = await res.text();
-		if (res.status === 403 || body.includes("cf-challenge")) {
-			return { _blocked: true, _status: res.status, _body: body };
-		}
-		try {
-			return JSON.parse(body);
-		} catch {
-			return { _blocked: true, _status: res.status, _body: body };
-		}
-	}, API_TIMEOUT);
+	const raw = await page.evaluate(
+		async ({ query, buildNumber, timeout, limit }) => {
+			const headers = {
+				accept: "application/json",
+				"content-type": "application/json",
+				"x-k-build-number": buildNumber,
+			};
+			const res = query
+				? await fetch("/kr-api/stores/search", {
+						method: "POST",
+						headers,
+						body: JSON.stringify({ query, limit, offset: 0 }),
+						signal: AbortSignal.timeout(timeout),
+					})
+				: await fetch("/kr-api/stores", {
+						headers,
+						signal: AbortSignal.timeout(timeout),
+					});
+			const body = await res.text();
+			if (res.status === 403 || body.includes("cf-challenge")) {
+				return { _blocked: true, _status: res.status, _body: body };
+			}
+			try {
+				return JSON.parse(body);
+			} catch {
+				return { _blocked: true, _status: res.status, _body: body };
+			}
+		},
+		{
+			query: query?.trim() || undefined,
+			buildNumber,
+			timeout: API_TIMEOUT,
+			limit: STORE_SEARCH_LIMIT,
+		},
+	);
 
 	try {
 		return StoresEvalResultSchema.parse(raw);
@@ -201,46 +251,40 @@ export async function searchProducts(
 
 	const products = (data.result ?? []).map(parseProduct);
 
-	logger.info({ query, resultCount: products.length }, "K-Ruoka search completed");
+	logger.info(
+		{ query, resultCount: products.length, totalHits: data.totalHits },
+		"K-Ruoka search completed",
+	);
 
 	return {
 		products,
-		totalCount: products.length,
+		totalCount: data.totalHits ?? products.length,
 		query,
 		storeId,
 		chain: "k-ruoka",
 	};
 }
 
-export async function getStores(city?: string): Promise<Store[]> {
-	logger.info({ city: city ?? "all" }, "Fetching K-Ruoka stores");
+export async function getStores(query?: string): Promise<Store[]> {
+	logger.info({ query: query ?? "all" }, "Fetching K-Ruoka stores");
 
-	let data = await fetchStoresApi();
+	let data = await fetchStoresApi(query);
 
 	if (isBlocked(data)) {
 		logger.warn({ status: data._status }, "Cloudflare block on stores fetch, resetting session");
 		await resetSession();
-		data = await fetchStoresApi();
+		data = await fetchStoresApi(query);
 		if (isBlocked(data)) {
 			throw new Error("Blocked by Cloudflare after session reset");
 		}
 	}
 
-	let stores: Store[] = (data.results ?? [])
-		.filter((s) => s.isWebStore)
-		.map((s) => ({
-			id: s.id,
-			name: s.name,
-			chain: "k-ruoka" as const,
-			location: s.location,
-		}));
+	const stores = (data.results ?? []).map(parseStore);
 
-	if (city) {
-		const lower = city.toLowerCase();
-		stores = stores.filter((s) => s.location.toLowerCase().includes(lower));
-	}
-
-	logger.info({ city: city ?? "all", storeCount: stores.length }, "K-Ruoka stores fetched");
+	logger.info(
+		{ query: query ?? "all", storeCount: stores.length, totalHits: data.totalHits },
+		"K-Ruoka stores fetched",
+	);
 
 	return stores;
 }

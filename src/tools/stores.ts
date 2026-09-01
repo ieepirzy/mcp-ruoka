@@ -11,12 +11,14 @@ export function registerStoresTool(server: McpServer): void {
 		"get_stores",
 		{
 			description:
-				"List stores from K-Ruoka (k-ruoka.fi), S-Kaupat (s-kaupat.fi), and Alko (alko.fi). Returns store IDs and chain values needed for search_products.",
+				"List stores from K-Ruoka (k-ruoka.fi), S-Kaupat (s-kaupat.fi), and Alko (alko.fi). Returns store IDs and chain values needed for search_products. For K-Ruoka, city may also be a store-name/place search such as 'K-Market Kangas'.",
 			inputSchema: z.object({
 				city: z
 					.string()
 					.optional()
-					.describe("Filter stores by city name (e.g., 'Helsinki', 'Tampere')"),
+					.describe(
+						"Filter by city/place. For K-Ruoka this may also be a store name (e.g., 'Jyväskylä' or 'K-Market Kangas').",
+					),
 				chain: z
 					.enum(["k-ruoka", "s-kaupat", "alko"])
 					.optional()
